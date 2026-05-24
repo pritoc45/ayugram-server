@@ -1,46 +1,147 @@
 const WebSocket = require('ws');
+const http = require('http');
+const crypto = require('crypto');
 
 const port = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port, maxPayload: 100 * 1024 * 1024 });
 
-const profiles = {};
+// ── HTTP сервер (для health check + keep-alive) ──
+const httpServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+    res.end('AyuGram Pro Server OK');
+});
+
+const wss = new WebSocket.Server({ server: httpServer, maxPayload: 100 * 1024 * 1024 });
+
+// ── БД (в памяти, но с персистентностью через JSON если нужно) ──
+const users = {};        // username → { passwordHash, salt, displayName, avatar, bio, createdAt }
 const activeSockets = {};
+const sessions = {};     // token → username
 
 console.log(`🚀 AyuGram Pro сервер запущен на порту ${port}`);
 
+// Keep-alive пинг каждые 14 минут (Render не засыпает)
+setInterval(() => {
+    http.get(`http://localhost:${port}`, () => {});
+    // Пинг всех клиентов
+    wss.clients.forEach(ws => {
+        if (ws.readyState === WebSocket.OPEN) ws.ping();
+    });
+}, 14 * 60 * 1000);
+
+function hashPassword(password, salt) {
+    return crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
+}
+
+function generateToken() {
+    return crypto.randomBytes(32).toString('hex');
+}
+
+function broadcast(data) {
+    const packet = JSON.stringify(data);
+    wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(packet); });
+}
+
+function broadcastUserList() {
+    const userList = Object.keys(users).map(u => ({
+        username: u,
+        displayName: users[u].displayName,
+        avatar: users[u].avatar,
+        bio: users[u].bio,
+        online: !!activeSockets[u],
+        lastSeen: users[u].lastSeen
+    }));
+    broadcast({ type: 'user_list', users: userList });
+}
+
+function sendTo(username, data) {
+    const sock = activeSockets[username];
+    if (sock && sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(data));
+}
+
 wss.on('connection', (ws) => {
     let myUsername = null;
+
+    ws.on('pong', () => {}); // heartbeat
 
     ws.on('message', (message) => {
         try {
             const p = JSON.parse(message.toString());
 
+            // ── REGISTER ──
+            if (p.type === 'register') {
+                const username = (p.username || '').trim().toLowerCase();
+                const password = p.password || '';
+                const displayName = (p.displayName || p.username || '').trim();
+
+                if (!username || username.length < 3)
+                    return ws.send(JSON.stringify({ type: 'error', code: 'register', text: 'Имя пользователя минимум 3 символа' }));
+                if (!password || password.length < 4)
+                    return ws.send(JSON.stringify({ type: 'error', code: 'register', text: 'Пароль минимум 4 символа' }));
+                if (!/^[a-z0-9_\.]+$/.test(username))
+                    return ws.send(JSON.stringify({ type: 'error', code: 'register', text: 'Только латиница, цифры, _ и .' }));
+                if (users[username])
+                    return ws.send(JSON.stringify({ type: 'error', code: 'register', text: 'Имя пользователя занято' }));
+
+                const salt = crypto.randomBytes(16).toString('hex');
+                const passwordHash = hashPassword(password, salt);
+                users[username] = {
+                    displayName: displayName || username,
+                    avatar: null,
+                    bio: 'Использую AyuGram',
+                    passwordHash, salt,
+                    createdAt: Date.now(),
+                    online: false,
+                    lastSeen: null
+                };
+                console.log(`✅ Зарегистрирован: ${username}`);
+                ws.send(JSON.stringify({ type: 'register_success', username }));
+            }
+
             // ── LOGIN ──
             if (p.type === 'login') {
-                const username = p.username.trim();
-                if (!username) return;
-                if (activeSockets[username] && activeSockets[username] !== ws) {
-                    return ws.send(JSON.stringify({ type: 'error', text: 'Ник сейчас используется на другом устройстве' }));
+                // Логин по токену (автологин)
+                if (p.token) {
+                    const uname = sessions[p.token];
+                    if (!uname || !users[uname])
+                        return ws.send(JSON.stringify({ type: 'error', code: 'auth', text: 'Сессия истекла, войдите снова' }));
+                    return doLogin(ws, uname, p.token);
                 }
-                myUsername = username;
-                activeSockets[myUsername] = ws;
-                if (!profiles[myUsername]) {
-                    profiles[myUsername] = { displayName: myUsername, avatar: null, bio: 'Использую AyuGram' };
-                }
-                profiles[myUsername].online = true;
-                console.log(`👤 В сети: ${myUsername}`);
-                ws.send(JSON.stringify({ type: 'auth_success', username: myUsername, profile: profiles[myUsername] }));
-                broadcastUserList();
+                // Логин по логину/паролю
+                const username = (p.username || '').trim().toLowerCase();
+                const password = p.password || '';
+                if (!users[username])
+                    return ws.send(JSON.stringify({ type: 'error', code: 'auth', text: 'Пользователь не найден' }));
+                const { passwordHash, salt } = users[username];
+                if (hashPassword(password, salt) !== passwordHash)
+                    return ws.send(JSON.stringify({ type: 'error', code: 'auth', text: 'Неверный пароль' }));
+                const token = generateToken();
+                sessions[token] = username;
+                doLogin(ws, username, token);
             }
 
             // ── UPDATE PROFILE ──
             if (p.type === 'update_profile') {
                 if (!myUsername) return;
-                if (p.displayName) profiles[myUsername].displayName = p.displayName;
-                if (p.bio !== undefined) profiles[myUsername].bio = p.bio;
-                if (p.avatar !== undefined) profiles[myUsername].avatar = p.avatar;
-                ws.send(JSON.stringify({ type: 'profile_updated', profile: profiles[myUsername] }));
+                if (p.displayName) users[myUsername].displayName = p.displayName;
+                if (p.bio !== undefined) users[myUsername].bio = p.bio;
+                if (p.avatar !== undefined) users[myUsername].avatar = p.avatar;
+                ws.send(JSON.stringify({ type: 'profile_updated', profile: getProfile(myUsername) }));
                 broadcastUserList();
+            }
+
+            // ── CHANGE PASSWORD ──
+            if (p.type === 'change_password') {
+                if (!myUsername) return;
+                const { oldPassword, newPassword } = p;
+                const { passwordHash, salt } = users[myUsername];
+                if (hashPassword(oldPassword, salt) !== passwordHash)
+                    return ws.send(JSON.stringify({ type: 'error', code: 'password', text: 'Неверный старый пароль' }));
+                if (!newPassword || newPassword.length < 4)
+                    return ws.send(JSON.stringify({ type: 'error', code: 'password', text: 'Новый пароль минимум 4 символа' }));
+                const newSalt = crypto.randomBytes(16).toString('hex');
+                users[myUsername].passwordHash = hashPassword(newPassword, newSalt);
+                users[myUsername].salt = newSalt;
+                ws.send(JSON.stringify({ type: 'password_changed' }));
             }
 
             // ── MESSAGE ──
@@ -64,28 +165,23 @@ wss.on('connection', (ws) => {
                 if (p.to === 'Избранное') {
                     ws.send(JSON.stringify(msg));
                 } else {
-                    const target = activeSockets[p.to];
-                    if (target && target.readyState === WebSocket.OPEN) target.send(JSON.stringify(msg));
+                    sendTo(p.to, msg);
                     ws.send(JSON.stringify(msg));
                 }
             }
 
-            // ── EDIT MESSAGE ──
+            // ── EDIT ──
             if (p.type === 'edit_message') {
                 if (!myUsername) return;
                 const payload = { type: 'msg_edited', from: myUsername, to: p.to, messageId: p.messageId, newText: p.newText };
-                const target = activeSockets[p.to];
-                if (target && target.readyState === WebSocket.OPEN) target.send(JSON.stringify(payload));
+                sendTo(p.to, payload);
                 ws.send(JSON.stringify(payload));
             }
 
             // ── TYPING ──
             if (p.type === 'typing') {
                 if (!myUsername) return;
-                const target = activeSockets[p.to];
-                if (target && target.readyState === WebSocket.OPEN) {
-                    target.send(JSON.stringify({ type: 'typing', from: myUsername }));
-                }
+                sendTo(p.to, { type: 'typing', from: myUsername });
             }
 
             // ── REACTION ──
@@ -93,11 +189,7 @@ wss.on('connection', (ws) => {
                 if (!myUsername) return;
                 const payload = { type: 'new_reaction', from: myUsername, to: p.to, messageId: p.messageId, reaction: p.reaction };
                 if (p.to === 'Избранное') ws.send(JSON.stringify(payload));
-                else {
-                    const target = activeSockets[p.to];
-                    if (target && target.readyState === WebSocket.OPEN) target.send(JSON.stringify(payload));
-                    ws.send(JSON.stringify(payload));
-                }
+                else { sendTo(p.to, payload); ws.send(JSON.stringify(payload)); }
             }
 
             // ── PIN ──
@@ -105,28 +197,23 @@ wss.on('connection', (ws) => {
                 if (!myUsername) return;
                 const payload = { type: 'message_pinned', from: myUsername, to: p.to, messageId: p.messageId, text: p.text };
                 if (p.to === 'Избранное') ws.send(JSON.stringify(payload));
-                else {
-                    const target = activeSockets[p.to];
-                    if (target && target.readyState === WebSocket.OPEN) target.send(JSON.stringify(payload));
-                    ws.send(JSON.stringify(payload));
-                }
+                else { sendTo(p.to, payload); ws.send(JSON.stringify(payload)); }
             }
 
-            // ── CALLS (audio + video) ──
+            // ── CALLS ──
             if (['call_offer','video_offer','call_answer','ice_candidate','call_end'].includes(p.type)) {
                 const target = activeSockets[p.to];
                 if (target && target.readyState === WebSocket.OPEN) {
                     p.from = myUsername;
                     target.send(JSON.stringify(p));
+                } else if (['call_offer','video_offer'].includes(p.type)) {
+                    ws.send(JSON.stringify({ type: 'call_end', from: p.to, reason: 'offline' }));
                 }
             }
 
-            // ── GROUP NOTIFICATIONS ──
+            // ── GROUP ──
             if (p.type === 'group_created') {
-                const target = activeSockets[p.to];
-                if (target && target.readyState === WebSocket.OPEN) {
-                    target.send(JSON.stringify({ type: 'group_invite', from: myUsername, groupId: p.groupId, groupData: p.groupData }));
-                }
+                sendTo(p.to, { type: 'group_invite', from: myUsername, groupId: p.groupId, groupData: p.groupData });
             }
 
         } catch (err) {
@@ -138,24 +225,38 @@ wss.on('connection', (ws) => {
         if (myUsername) {
             console.log(`💤 Отключился: ${myUsername}`);
             delete activeSockets[myUsername];
-            if (profiles[myUsername]) {
-                profiles[myUsername].online = false;
-                profiles[myUsername].lastSeen = Date.now();
+            if (users[myUsername]) {
+                users[myUsername].online = false;
+                users[myUsername].lastSeen = Date.now();
             }
             broadcastUserList();
         }
     });
+
+    ws.on('error', err => console.error('WS error:', err.message));
+
+    function doLogin(ws, username, token) {
+        if (activeSockets[username] && activeSockets[username] !== ws) {
+            activeSockets[username].send(JSON.stringify({ type: 'kicked', text: 'Вы вошли с другого устройства' }));
+            activeSockets[username].close();
+        }
+        myUsername = username;
+        activeSockets[username] = ws;
+        users[username].online = true;
+        console.log(`👤 В сети: ${username}`);
+        ws.send(JSON.stringify({
+            type: 'auth_success',
+            username,
+            token,
+            profile: getProfile(username)
+        }));
+        broadcastUserList();
+    }
 });
 
-function broadcastUserList() {
-    const users = Object.keys(profiles).map(u => ({
-        username: u,
-        displayName: profiles[u].displayName,
-        avatar: profiles[u].avatar,
-        bio: profiles[u].bio,
-        online: !!activeSockets[u],
-        lastSeen: profiles[u].lastSeen
-    }));
-    const packet = JSON.stringify({ type: 'user_list', users });
-    wss.clients.forEach(client => { if (client.readyState === WebSocket.OPEN) client.send(packet); });
+function getProfile(username) {
+    const u = users[username];
+    return { displayName: u.displayName, avatar: u.avatar, bio: u.bio };
 }
+
+httpServer.listen(port, () => console.log(`HTTP + WS на порту ${port}`));
